@@ -65,6 +65,46 @@
             width: 100%;
         }
 
+        .filter-row {
+            display: flex;
+            gap: 0.5rem;
+            margin-top: 0.75rem;
+        }
+
+        #docTypeInput {
+            flex: 1;
+            padding: 0.75rem 1rem;
+            font-size: 0.9rem;
+            border: 1px solid var(--border-color);
+            border-radius: 0.5rem;
+            outline: none;
+        }
+
+        #docTypeInput:focus {
+            border-color: var(--primary-color);
+        }
+
+        #resetIndexBtn {
+            padding: 0.75rem 1rem;
+            background-color: #dc2626;
+            color: white;
+            border: none;
+            border-radius: 0.5rem;
+            font-size: 0.9rem;
+            font-weight: 600;
+            cursor: pointer;
+            white-space: nowrap;
+        }
+
+        #resetIndexBtn:hover {
+            background-color: #b91c1c;
+        }
+
+        #resetIndexBtn:disabled {
+            background-color: var(--text-secondary);
+            cursor: not-allowed;
+        }
+
         #searchInput {
             flex: 1;
             padding: 1rem 1.25rem;
@@ -345,6 +385,15 @@
                 >
                 <button id="searchBtn">Search</button>
             </div>
+            <div class="filter-row">
+                <input
+                    type="text"
+                    id="docTypeInput"
+                    placeholder="Doc type filter (optional): all, folder, txt, docx, pdf, image, video..."
+                    value="all"
+                >
+                <button id="resetIndexBtn" type="button">Reset Index</button>
+            </div>
         </div>
 
         <div id="indexStatus" class="status-banner"></div>
@@ -462,6 +511,20 @@
             const tagLabel = isFolder ? 'FOLDER' : (file.extension || 'other').toUpperCase();
             const downloadLabel = isFolder ? '⬇️ Download ZIP' : '⬇️ Download';
             const truncatedPath = truncatePath(file.path);
+            const reasons = Array.isArray(file.match_reasons) ? file.match_reasons : [];
+            const reasonsText = reasons.length ? reasons.join('; ') : '';
+            const relevanceText = typeof file.relevance_score === 'number'
+                ? (file.relevance_score <= 1
+                    ? `${(file.relevance_score * 100).toFixed(1)}%`
+                    : `${file.relevance_score.toFixed(1)}`)
+                : '';
+            const scoreBreakdown = (file.score_breakdown && typeof file.score_breakdown === 'object') ? file.score_breakdown : null;
+            const breakdownText = scoreBreakdown
+                ? Object.entries(scoreBreakdown)
+                    .filter(([, value]) => typeof value === 'number' && value > 0)
+                    .map(([key, value]) => `${key}: ${value.toFixed(1)}%`)
+                    .join(' | ')
+                : '';
             
             const sizeText = formatFileSize(file.size);
 
@@ -489,10 +552,22 @@
                             <span class="metadata-label">Path:</span>
                             <span class="metadata-value path-truncated" title="${escapeHtml(file.path)}">${escapeHtml(truncatedPath)}</span>
                         </li>
-                        ${file.relevance_score ? `
+                        ${relevanceText ? `
                         <li class="metadata-item">
                             <span class="metadata-label">Relevance:</span>
-                            <span class="metadata-value">${(file.relevance_score * 100).toFixed(1)}%</span>
+                            <span class="metadata-value">${relevanceText}</span>
+                        </li>
+                        ` : ''}
+                        ${breakdownText ? `
+                        <li class="metadata-item">
+                            <span class="metadata-label">Score:</span>
+                            <span class="metadata-value">${escapeHtml(breakdownText)}</span>
+                        </li>
+                        ` : ''}
+                        ${reasonsText ? `
+                        <li class="metadata-item">
+                            <span class="metadata-label">Why:</span>
+                            <span class="metadata-value">${escapeHtml(reasonsText)}</span>
                         </li>
                         ` : ''}
                     </ul>
@@ -554,16 +629,19 @@
 
                 const status = await response.json();
                 const searchBtn = document.getElementById('searchBtn');
+                const resetBtn = document.getElementById('resetIndexBtn');
 
                 if (status.error) {
                     setStatusBanner(`Indexing error: ${status.error}`, 'status-error');
                     searchBtn.disabled = false;
+                    resetBtn.disabled = false;
                     return;
                 }
 
                 if (status.is_indexing) {
                     const pathText = status.current_path ? ` Current: ${shortenPath(status.current_path)}.` : '';
                     setStatusBanner(`Indexing in progress. Indexed ${status.indexed_files} files so far.${pathText}`, 'status-info');
+                    resetBtn.disabled = true;
                     if (status.indexed_files === 0) {
                         searchBtn.disabled = true;
                         searchBtn.textContent = 'Indexing...';
@@ -575,17 +653,57 @@
                     setStatusBanner(`Indexing complete. Indexed ${status.indexed_files} files.`, 'status-ok');
                     searchBtn.disabled = false;
                     searchBtn.textContent = 'Search';
+                    resetBtn.disabled = false;
                     return;
                 }
 
                 setStatusBanner('', 'status-info');
+                resetBtn.disabled = false;
             } catch (error) {
                 // Keep UI usable even if status polling fails.
             }
         }
 
+        async function resetIndex() {
+            const resetBtn = document.getElementById('resetIndexBtn');
+            resetBtn.disabled = true;
+
+            try {
+                const response = await fetch(`${API_BASE_URL}/index/reset`, {
+                    method: 'POST'
+                });
+
+                if (!response.ok) {
+                    const errorData = await response.json();
+                    throw new Error(errorData.detail || 'Failed to reset index');
+                }
+
+                const resultsInfo = document.getElementById('resultsInfo');
+                const resultsContainer = document.getElementById('resultsContainer');
+                resultsInfo.textContent = '';
+                resultsContainer.innerHTML = '<div class="no-results"><p>Index reset. Rebuilding index...</p></div>';
+
+                setStatusBanner('Index reset complete. Starting fresh indexing...', 'status-info');
+                await startIndexingFromDefaults();
+                await updateIndexStatus();
+            } catch (error) {
+                setStatusBanner(`Failed to reset index: ${error.message}`, 'status-error');
+            } finally {
+                resetBtn.disabled = false;
+            }
+        }
+
         async function startIndexingFromDefaults() {
             try {
+                const statusResponse = await fetch(`${API_BASE_URL}/index/status`);
+                if (statusResponse.ok) {
+                    const status = await statusResponse.json();
+                    if (!status.is_indexing && status.indexed_files > 0 && !status.error) {
+                        setStatusBanner(`Loaded cached index with ${status.indexed_files} items.`, 'status-ok');
+                        return;
+                    }
+                }
+
                 const response = await fetch(`${API_BASE_URL}/index/scan`, {
                     method: 'POST',
                     headers: {
@@ -614,6 +732,7 @@
             const resultsInfo = document.getElementById('resultsInfo');
             const errorContainer = document.getElementById('errorContainer');
             const searchBtn = document.getElementById('searchBtn');
+            const docTypeInput = document.getElementById('docTypeInput');
             
             if (!query.trim()) {
                 resultsContainer.innerHTML = '<div class="no-results"><p>Please enter a search query</p></div>';
@@ -633,7 +752,10 @@
                     headers: {
                         'Content-Type': 'application/json'
                     },
-                    body: JSON.stringify({ query: query })
+                    body: JSON.stringify({
+                        query: query,
+                        document_type: (docTypeInput.value || 'all').trim() || 'all'
+                    })
                 });
 
                 if (!response.ok) {
@@ -673,6 +795,10 @@
                 const query = document.getElementById('searchInput').value;
                 searchFiles(query);
             }
+        });
+
+        document.getElementById('resetIndexBtn').addEventListener('click', () => {
+            resetIndex();
         });
 
         // Focus on search input on load

@@ -48,5 +48,6 @@ Thumbs.db
 # Local temporary artifacts
 *.zip
 *.tmp
+.cache/
 
 notes.md

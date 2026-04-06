@@ -46,6 +46,7 @@ class SearchResult:
     score: float
     match_type: str  # metadata_only, content_grounding
     snippets: list[str] = field(default_factory=list)
+    score_breakdown: dict[str, float] = field(default_factory=dict)
     
     def to_dict(self) -> dict:
         return {
@@ -53,6 +54,7 @@ class SearchResult:
             "score": self.score,
             "match_type": self.match_type,
             "snippets": self.snippets,
+            "score_breakdown": self.score_breakdown,
         }
 
 

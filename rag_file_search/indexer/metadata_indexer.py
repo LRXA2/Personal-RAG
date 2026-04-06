@@ -13,6 +13,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 import fnmatch
+import pickle
 import sys
 
 # Add parent directory to path for imports
@@ -124,11 +125,157 @@ class MetadataIndexer:
                 dir_metadata.size_bytes = dir_size_bytes
         
         return count
+
+    def refresh_directory(self, directory: str, progress_callback=None) -> dict:
+        """
+        Incrementally refresh a directory against existing index state.
+
+        Adds new entries, updates changed ones, and removes deleted paths.
+
+        Returns:
+            Dict with counts: scanned, added, updated, removed
+        """
+        root_path = Path(directory).resolve()
+        root_key = str(root_path).lower()
+
+        existing_under_root = {
+            p for p in self._path_to_metadata.keys()
+            if p == root_key or p.startswith(root_key + os.sep)
+        }
+
+        seen_paths: set[str] = set()
+        scanned = 0
+        added = 0
+        updated = 0
+
+        for dirpath, dirnames, filenames in os.walk(root_path, followlinks=False):
+            # Filter blocked directories before descending
+            dirnames[:] = [
+                d for d in dirnames
+                if d.lower() not in self.policy.blocked_dirs
+            ]
+
+            current_dir = Path(dirpath)
+            try:
+                allowed, _ = self.policy.is_path_allowed(str(current_dir))
+                if not allowed:
+                    continue
+
+                dir_resolved = current_dir.resolve()
+                dir_key = str(dir_resolved).lower()
+                seen_paths.add(dir_key)
+
+                dir_stat = current_dir.stat()
+                display_name = current_dir.name or current_dir.drive or str(current_dir)
+                direct_file_bytes = 0
+
+                existing_dir = self._path_to_metadata.get(dir_key)
+                if existing_dir is None:
+                    dir_metadata = FileMetadata(
+                        filename=display_name,
+                        full_path=str(dir_resolved),
+                        parent_folder=str(dir_resolved.parent),
+                        extension="",
+                        file_type="folder",
+                        size_bytes=0,
+                        modified_date=datetime.fromtimestamp(dir_stat.st_mtime),
+                        created_date=datetime.fromtimestamp(dir_stat.st_ctime),
+                    )
+                    self.index.append(dir_metadata)
+                    self._path_to_metadata[dir_key] = dir_metadata
+                    added += 1
+                    scanned += 1
+                    if progress_callback:
+                        progress_callback(scanned, str(current_dir))
+                    existing_dir = dir_metadata
+                else:
+                    old_modified = existing_dir.modified_date
+                    old_created = existing_dir.created_date
+                    existing_dir.filename = display_name
+                    existing_dir.parent_folder = str(dir_resolved.parent)
+                    existing_dir.file_type = "folder"
+                    existing_dir.extension = ""
+                    existing_dir.modified_date = datetime.fromtimestamp(dir_stat.st_mtime)
+                    existing_dir.created_date = datetime.fromtimestamp(dir_stat.st_ctime)
+                    if old_modified != existing_dir.modified_date or old_created != existing_dir.created_date:
+                        updated += 1
+
+                for filename in filenames:
+                    file_path = os.path.join(dirpath, filename)
+
+                    try:
+                        allowed_file, _ = self.policy.is_path_allowed(file_path)
+                        if not allowed_file:
+                            continue
+
+                        stat = os.stat(file_path)
+                        file_abs = os.path.abspath(file_path)
+                        file_key = file_abs.lower()
+                        seen_paths.add(file_key)
+
+                        direct_file_bytes += stat.st_size
+
+                        existing_file = self._path_to_metadata.get(file_key)
+                        if existing_file is None:
+                            metadata = FileMetadata(
+                                filename=filename,
+                                full_path=file_abs,
+                                parent_folder=os.path.dirname(file_abs),
+                                extension=Path(filename).suffix.lower(),
+                                file_type=self.policy.get_file_type(file_path),
+                                size_bytes=stat.st_size,
+                                modified_date=datetime.fromtimestamp(stat.st_mtime),
+                                created_date=datetime.fromtimestamp(stat.st_ctime),
+                            )
+                            self.index.append(metadata)
+                            self._path_to_metadata[file_key] = metadata
+                            added += 1
+                        else:
+                            new_modified = datetime.fromtimestamp(stat.st_mtime)
+                            changed = (
+                                existing_file.size_bytes != stat.st_size or
+                                existing_file.modified_date != new_modified
+                            )
+                            existing_file.filename = filename
+                            existing_file.parent_folder = os.path.dirname(file_abs)
+                            existing_file.extension = Path(filename).suffix.lower()
+                            existing_file.file_type = self.policy.get_file_type(file_path)
+                            existing_file.size_bytes = stat.st_size
+                            existing_file.modified_date = new_modified
+                            existing_file.created_date = datetime.fromtimestamp(stat.st_ctime)
+                            if changed:
+                                updated += 1
+
+                        scanned += 1
+                        if progress_callback:
+                            progress_callback(scanned, file_path)
+
+                    except (OSError, PermissionError):
+                        continue
+
+                existing_dir.size_bytes = direct_file_bytes
+
+            except (OSError, PermissionError):
+                continue
+
+        to_remove = existing_under_root - seen_paths
+        if to_remove:
+            for path_key in to_remove:
+                self._path_to_metadata.pop(path_key, None)
+            self.index = [m for m in self.index if m.full_path.lower() not in to_remove]
+
+        return {
+            "scanned": scanned,
+            "added": added,
+            "updated": updated,
+            "removed": len(to_remove),
+        }
     
     def search(
         self,
         query: str,
         extension_filter: Optional[list[str]] = None,
+        file_type_filter: Optional[list[str]] = None,
         date_from: Optional[datetime] = None,
         date_to: Optional[datetime] = None,
         folder_contains: Optional[str] = None,
@@ -155,6 +302,9 @@ class MetadataIndexer:
         for metadata in self.index:
             # Apply filters
             if extension_filter and metadata.extension not in extension_filter:
+                continue
+
+            if file_type_filter and metadata.file_type not in file_type_filter:
                 continue
             
             if date_from and metadata.modified_date < date_from:
@@ -237,3 +387,49 @@ class MetadataIndexer:
     def count(self) -> int:
         """Return total number of indexed files."""
         return len(self.index)
+
+    def save_cache(self, cache_path: str, scanned_directories: Optional[list[str]] = None) -> None:
+        """Persist the in-memory metadata index to disk."""
+        path = Path(cache_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        payload = {
+            "version": 1,
+            "saved_at": datetime.utcnow().isoformat(),
+            "scanned_directories": scanned_directories or [],
+            "items": [m.to_dict() for m in self.index],
+        }
+
+        with open(path, "wb") as f:
+            pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+    def load_cache(self, cache_path: str) -> tuple[int, list[str]]:
+        """Load metadata index from disk and replace current in-memory index."""
+        path = Path(cache_path)
+        if not path.exists():
+            return 0, []
+
+        with open(path, "rb") as f:
+            payload = pickle.load(f)
+
+        items = payload.get("items", [])
+        scanned_directories = payload.get("scanned_directories", [])
+
+        self.index = []
+        self._path_to_metadata = {}
+
+        for item in items:
+            metadata = FileMetadata(
+                filename=item.get("filename", ""),
+                full_path=item.get("full_path", ""),
+                parent_folder=item.get("parent_folder", ""),
+                extension=item.get("extension", ""),
+                file_type=item.get("file_type", "other"),
+                size_bytes=item.get("size_bytes", 0),
+                modified_date=datetime.fromisoformat(item["modified_date"]) if item.get("modified_date") else datetime.utcnow(),
+                created_date=datetime.fromisoformat(item["created_date"]) if item.get("created_date") else None,
+            )
+            self.index.append(metadata)
+            self._path_to_metadata[metadata.full_path.lower()] = metadata
+
+        return len(self.index), scanned_directories

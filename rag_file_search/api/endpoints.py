@@ -34,6 +34,7 @@ from core.planner import LLMPlanner
 
 
 DEFAULT_ALLOWED_ROOTS = ["D:/Aarron/", "E:/"]
+DEFAULT_INDEX_CACHE_PATH = ".cache/metadata_index.pkl"
 
 
 # Request/Response models
@@ -41,6 +42,7 @@ DEFAULT_ALLOWED_ROOTS = ["D:/Aarron/", "E:/"]
 class SearchRequest(BaseModel):
     query: str
     max_results: int = 50
+    document_type: str = "all"
 
 
 class FileMetadataSimple(BaseModel):
@@ -51,6 +53,8 @@ class FileMetadataSimple(BaseModel):
     size: int
     modified_date: str
     relevance_score: Optional[float] = None
+    match_reasons: List[str] = Field(default_factory=list)
+    score_breakdown: dict[str, float] = Field(default_factory=dict)
 
 
 class SearchResponse(BaseModel):
@@ -61,6 +65,7 @@ class SearchResponse(BaseModel):
 
 class RetrieveFilesRequest(BaseModel):
     query: str
+    document_type: str = "all"
     extension_filter: Optional[List[str]] = None
     date_from: Optional[datetime] = None
     date_to: Optional[datetime] = None
@@ -138,6 +143,7 @@ class StatsResponse(BaseModel):
 
 class ScanDirectoriesRequest(BaseModel):
     directories: List[str] = Field(default_factory=list)
+    incremental: bool = True
 
 
 class IndexStatusResponse(BaseModel):
@@ -200,6 +206,11 @@ def _get_default_scan_directories() -> list[str]:
     return _get_allowed_roots()
 
 
+def _get_index_cache_path() -> str:
+    """Get index cache path from env var or default."""
+    return os.getenv("RAG_INDEX_CACHE_PATH", DEFAULT_INDEX_CACHE_PATH)
+
+
 def _validate_scan_directories(directories: List[str], active_policy: SafetyPolicy) -> list[str]:
     """Validate and normalize directories for scan requests."""
     normalized: list[str] = []
@@ -231,6 +242,79 @@ def _validate_scan_directories(directories: List[str], active_policy: SafetyPoli
     return normalized
 
 
+def _normalize_extension(value: str) -> str:
+    ext = (value or "").strip().lower()
+    if not ext:
+        return ""
+    return ext if ext.startswith(".") else f".{ext}"
+
+
+def _resolve_document_filters(
+    document_type: str,
+    extension_filter: Optional[List[str]] = None,
+) -> tuple[Optional[list[str]], Optional[list[str]]]:
+    """
+    Resolve API filters from document_type and extension_filter.
+
+    `document_type` supports comma-separated tokens such as:
+      - broad types: folder, text, code, document, data, image, video, other
+      - extensions: docx, txt, pdf (with or without leading dot)
+      - all / * / any: no filtering
+    """
+    file_types: set[str] = set()
+    extensions: set[str] = set()
+
+    if extension_filter:
+        for ext in extension_filter:
+            normalized = _normalize_extension(ext)
+            if normalized:
+                extensions.add(normalized)
+
+    raw = (document_type or "all").strip().lower()
+    if raw in {"all", "*", "any", ""}:
+        return None, sorted(list(extensions)) if extensions else None
+
+    tokens = [t.strip().lower() for t in raw.split(",") if t.strip()]
+    if not tokens:
+        return None, sorted(list(extensions)) if extensions else None
+
+    allowed_file_types = {
+        "folder", "text", "code", "document", "data", "image", "video", "other",
+    }
+
+    # Common aliases for convenience
+    alias_map = {
+        "folders": "folder",
+        "docs": "document",
+        "images": "image",
+        "videos": "video",
+    }
+
+    for token in tokens:
+        token = alias_map.get(token, token)
+        if token in allowed_file_types:
+            file_types.add(token)
+            continue
+
+        normalized_ext = _normalize_extension(token)
+        if normalized_ext:
+            extensions.add(normalized_ext)
+            continue
+
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Invalid document_type token. Use comma-separated values like: "
+                "all, folder, text, code, document, data, image, video, other, "
+                "or extensions such as txt, docx, pdf"
+            ),
+        )
+
+    file_type_filter = sorted(list(file_types)) if file_types else None
+    extension_filter_resolved = sorted(list(extensions)) if extensions else None
+    return file_type_filter, extension_filter_resolved
+
+
 @app.on_event("startup")
 async def startup_event():
     """Initialize services on startup."""
@@ -246,10 +330,29 @@ async def startup_event():
         max_metadata_results=50,
         max_files_to_read=10,
         max_chunks_per_file=5,
+        lexical_weight=0.6,
+        semantic_weight=0.4,
     )
     
     retrieval_service = RetrievalService(policy=policy, config=config)
     planner = LLMPlanner()
+
+    # Load cached index if available
+    cache_path = _get_index_cache_path()
+    try:
+        loaded_count, cached_dirs = retrieval_service.load_index_cache(cache_path)
+        if loaded_count > 0:
+            with _index_status_lock:
+                _index_status["is_indexing"] = False
+                _index_status["indexed_files"] = loaded_count
+                _index_status["current_path"] = None
+                _index_status["directories"] = cached_dirs
+                _index_status["started_at"] = None
+                _index_status["finished_at"] = _utcnow_iso()
+                _index_status["error"] = None
+            print(f"[OK] Loaded cached index with {loaded_count} items", flush=True)
+    except Exception as exc:
+        print(f"[WARN] Failed to load index cache: {exc}", flush=True)
     
     # Auto-scan directories in the background if specified
     if _dirs_to_scan_on_startup and retrieval_service:
@@ -277,6 +380,7 @@ async def startup_event():
                         print(f"[INFO] Indexed {total_count} files...", flush=True)
 
                 count = retrieval_service.index_directories(dirs, progress_callback=_progress)
+                retrieval_service.save_index_cache(_get_index_cache_path(), scanned_directories=dirs)
 
                 with _index_status_lock:
                     _index_status["is_indexing"] = False
@@ -306,12 +410,18 @@ async def retrieve_files(request: RetrieveFilesRequest):
     """
     if retrieval_service is None:
         raise HTTPException(status_code=503, detail="Service not initialized")
-    
+
+    file_type_filter, extension_filter = _resolve_document_filters(
+        request.document_type,
+        request.extension_filter,
+    )
+
     retrieval_service.reset_limits()
     
     results = retrieval_service.retrieve(
         query=request.query,
-        extension_filter=request.extension_filter,
+        extension_filter=extension_filter,
+        file_type_filter=file_type_filter,
         date_from=request.date_from,
         date_to=request.date_to,
         folder_contains=request.folder_contains,
@@ -528,6 +638,8 @@ async def scan_directories(request: ScanDirectoriesRequest):
     else:
         directories = _validate_scan_directories(_get_default_scan_directories(), retrieval_service.policy)
 
+    incremental = request.incremental
+
     with _index_status_lock:
         if _index_status["is_indexing"]:
             raise HTTPException(status_code=409, detail="Indexing already in progress")
@@ -549,7 +661,16 @@ async def scan_directories(request: ScanDirectoriesRequest):
                 if total_count % 500 == 0:
                     print(f"[INFO] Indexed {total_count} files...", flush=True)
 
-            count = retrieval_service.index_directories(directories, progress_callback=_progress)
+            if incremental:
+                refresh_stats = retrieval_service.refresh_directories(directories, progress_callback=_progress)
+                count = retrieval_service.get_index_stats()["total_files"]
+                print(
+                    f"[OK] Incremental refresh done: +{refresh_stats['added']} ~{refresh_stats['updated']} -{refresh_stats['removed']}",
+                    flush=True,
+                )
+            else:
+                count = retrieval_service.index_directories(directories, progress_callback=_progress)
+            retrieval_service.save_index_cache(_get_index_cache_path(), scanned_directories=directories)
 
             with _index_status_lock:
                 _index_status["is_indexing"] = False
@@ -570,7 +691,45 @@ async def scan_directories(request: ScanDirectoriesRequest):
     return {
         "started": True,
         "directories": directories,
+        "incremental": incremental,
         "message": "Indexing started in background",
+    }
+
+
+@app.post("/index/reset")
+async def reset_index():
+    """Clear in-memory index and remove persisted cache."""
+    if retrieval_service is None:
+        raise HTTPException(status_code=503, detail="Service not initialized")
+
+    with _index_status_lock:
+        if _index_status["is_indexing"]:
+            raise HTTPException(status_code=409, detail="Cannot reset while indexing is in progress")
+
+    retrieval_service.clear_index()
+
+    cache_path = Path(_get_index_cache_path())
+    cache_removed = False
+    try:
+        if cache_path.exists():
+            cache_path.unlink()
+            cache_removed = True
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Index cleared but failed to remove cache: {exc}")
+
+    with _index_status_lock:
+        _index_status["is_indexing"] = False
+        _index_status["indexed_files"] = 0
+        _index_status["current_path"] = None
+        _index_status["directories"] = []
+        _index_status["started_at"] = None
+        _index_status["finished_at"] = _utcnow_iso()
+        _index_status["error"] = None
+
+    return {
+        "cleared": True,
+        "cache_removed": cache_removed,
+        "cache_path": str(cache_path),
     }
 
 
@@ -601,6 +760,8 @@ async def search(request: SearchRequest):
     if retrieval_service is None:
         raise HTTPException(status_code=503, detail="Service not initialized")
 
+    file_type_filter, extension_filter = _resolve_document_filters(request.document_type)
+
     with _index_status_lock:
         is_indexing = _index_status["is_indexing"]
         indexed_files = _index_status["indexed_files"]
@@ -617,6 +778,8 @@ async def search(request: SearchRequest):
     
     results = retrieval_service.retrieve(
         query=request.query,
+        extension_filter=extension_filter,
+        file_type_filter=file_type_filter,
         max_results=request.max_results,
         needs_content=False,
     )
@@ -634,6 +797,8 @@ async def search(request: SearchRequest):
             size=r.metadata.size_bytes,
             modified_date=r.metadata.modified_date.isoformat(),
             relevance_score=r.score,
+            match_reasons=r.snippets,
+            score_breakdown=r.score_breakdown,
         ))
     
     return SearchResponse(
