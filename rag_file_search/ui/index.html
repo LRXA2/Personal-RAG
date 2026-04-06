@@ -463,7 +463,7 @@
             const downloadLabel = isFolder ? '⬇️ Download ZIP' : '⬇️ Download';
             const truncatedPath = truncatePath(file.path);
             
-            const sizeText = isFolder ? 'Folder' : formatFileSize(file.size);
+            const sizeText = formatFileSize(file.size);
 
             return `
                 <div class="card">

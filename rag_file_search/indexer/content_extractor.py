@@ -50,10 +50,16 @@ class ContentExtractor:
         Extract text content from a file.
         
         Supports: txt, md, py, js, json, yaml, csv, log, etc.
-        For PDF/DOCX, returns None (would need additional libraries).
+        Also supports PDF and DOCX when optional dependencies are installed.
         """
         path = Path(file_path)
         ext = path.suffix.lower()
+
+        if ext == '.pdf':
+            return self._extract_pdf_text(path)
+
+        if ext == '.docx':
+            return self._extract_docx_text(path)
         
         try:
             # Try reading as UTF-8 first
@@ -78,6 +84,54 @@ class ContentExtractor:
                     return f.read()
             except Exception:
                 return None
+        except Exception:
+            return None
+
+    def _extract_pdf_text(self, path: Path) -> Optional[str]:
+        """Extract text from a PDF file using pypdf."""
+        try:
+            from pypdf import PdfReader
+        except Exception:
+            return None
+
+        try:
+            reader = PdfReader(str(path))
+            pages = []
+            for page in reader.pages:
+                page_text = page.extract_text() or ""
+                if page_text:
+                    pages.append(page_text)
+            if not pages:
+                return None
+            return "\n\n".join(pages)
+        except Exception:
+            return None
+
+    def _extract_docx_text(self, path: Path) -> Optional[str]:
+        """Extract text from a DOCX file using python-docx."""
+        try:
+            from docx import Document
+        except Exception:
+            return None
+
+        try:
+            doc = Document(str(path))
+            parts = []
+
+            for paragraph in doc.paragraphs:
+                text = paragraph.text.strip()
+                if text:
+                    parts.append(text)
+
+            for table in doc.tables:
+                for row in table.rows:
+                    cells = [cell.text.strip() for cell in row.cells if cell.text.strip()]
+                    if cells:
+                        parts.append(" | ".join(cells))
+
+            if not parts:
+                return None
+            return "\n\n".join(parts)
         except Exception:
             return None
     

@@ -46,6 +46,8 @@ class MetadataIndexer:
         
         for dirpath, dirnames, filenames in os.walk(root_path, followlinks=False):
             # Index the current directory itself
+            dir_metadata = None
+            dir_key = None
             try:
                 current_dir = Path(dirpath)
                 allowed, _ = self.policy.is_path_allowed(str(current_dir))
@@ -70,6 +72,8 @@ class MetadataIndexer:
 
                         if progress_callback:
                             progress_callback(count, str(current_dir))
+                    else:
+                        dir_metadata = self._path_to_metadata.get(dir_key)
             except (OSError, PermissionError):
                 pass
 
@@ -79,6 +83,7 @@ class MetadataIndexer:
                 if d.lower() not in self.policy.blocked_dirs
             ]
             
+            dir_size_bytes = 0
             for filename in filenames:
                 file_path = os.path.join(dirpath, filename)
                 
@@ -106,6 +111,7 @@ class MetadataIndexer:
                     self.index.append(metadata)
                     self._path_to_metadata[metadata.full_path.lower()] = metadata
                     count += 1
+                    dir_size_bytes += stat.st_size
                     
                     if progress_callback:
                         progress_callback(count, file_path)
@@ -113,6 +119,9 @@ class MetadataIndexer:
                 except (OSError, PermissionError):
                     # Skip files we can't access
                     continue
+
+            if dir_metadata is not None:
+                dir_metadata.size_bytes = dir_size_bytes
         
         return count
     
