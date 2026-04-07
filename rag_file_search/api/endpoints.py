@@ -33,7 +33,7 @@ from core.retrieval_service import RetrievalService, RetrievalConfig
 from core.planner import LLMPlanner
 
 
-DEFAULT_ALLOWED_ROOTS = ["D:/Aarron/", "E:/"]
+DEFAULT_ALLOWED_ROOTS = ["D:/", "E:/"]
 DEFAULT_INDEX_CACHE_PATH = ".cache/metadata_index.pkl"
 
 
