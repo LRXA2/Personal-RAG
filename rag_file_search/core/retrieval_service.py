@@ -8,7 +8,7 @@ This module implements the core retrieval pipeline:
 
 from typing import Optional
 from dataclasses import dataclass, field
-from collections import Counter
+from collections import Counter, defaultdict
 import math
 import re
 from datetime import datetime
@@ -69,6 +69,19 @@ class RetrievalService:
         self.extractor = ContentExtractor(ChunkingConfig())
         self._stop_tokens = {
             "the", "a", "an", "is", "are", "was", "were", "in", "on", "at", "to", "for", "of", "by", "and", "or", "with", "from", "that", "this", "it", "as", "be", "where",
+        }
+        self._query_synonyms = {
+            "passport": ["identity", "id", "travel", "visa"],
+            "id": ["identity", "passport", "license"],
+            "resume": ["cv"],
+            "cv": ["resume"],
+            "tax": ["return", "irs", "finance"],
+            "bank": ["statement", "account", "finance"],
+            "insurance": ["policy", "claim"],
+            "certificate": ["cert", "record"],
+            "personal": ["private", "identity"],
+            "document": ["record", "paper"],
+            "documents": ["records", "papers"],
         }
         
         # Track how many files we've read this session
@@ -264,7 +277,9 @@ class RetrievalService:
         if not metadata_results:
             return metadata_results
 
-        query_tokens = self._tokenize(query)
+        query_terms = self._expand_query_terms(query)
+        query_tokens = [term for term, _ in query_terms]
+        query_token_weights = dict(query_terms)
         if not query_tokens:
             return metadata_results
 
@@ -292,6 +307,7 @@ class RetrievalService:
         is_content_query = self._is_content_query(query_tokens)
         wants_recent = self._wants_recent(query_tokens)
         is_personal_query = self._is_personal_query(query_tokens)
+        extension_priors = self._infer_extension_priors(query_tokens)
         query_lower = query.lower().strip()
         now = datetime.now()
 
@@ -308,7 +324,7 @@ class RetrievalService:
                 idf = math.log(((doc_count - df + 0.5) / (df + 0.5)) + 1.0)
                 numerator = tf * (k1 + 1.0)
                 denominator = tf + k1 * (1.0 - b + b * (doc_len / max(avg_doc_len, 1e-6)))
-                bm25_score += idf * (numerator / max(denominator, 1e-6))
+                bm25_score += query_token_weights.get(token, 1.0) * idf * (numerator / max(denominator, 1e-6))
 
             feature_bonus = 0.0
             if query_lower:
@@ -328,6 +344,8 @@ class RetrievalService:
 
             if metadata.file_type != "folder" and is_content_query:
                 feature_bonus += 3.0
+
+            feature_bonus += extension_priors.get(metadata.extension.lower(), 0.0)
 
             if is_personal_query:
                 ext = metadata.extension.lower()
@@ -372,24 +390,30 @@ class RetrievalService:
             recency_bonus = self._recency_bonus(metadata.modified_date, now, wants_recent)
 
             # Blend original ranker with reranker signals.
-            base_component = max(0.0, base_score * 0.65)
-            bm25_component = max(0.0, bm25_score * 20.0)
-            feature_component = max(0.0, feature_bonus)
-            recency_component = max(0.0, recency_bonus)
+            base_component = base_score * 0.65
+            bm25_component = bm25_score * 20.0
+            feature_component = feature_bonus
+            recency_component = recency_bonus
 
             combined_score = (base_score * 0.65) + (bm25_score * 20.0) + feature_bonus + recency_bonus
             reranked.append((metadata, combined_score))
 
-            total_component = base_component + bm25_component + feature_component + recency_component
-            if total_component > 0:
+            total_component_abs = (
+                abs(base_component)
+                + abs(bm25_component)
+                + abs(feature_component)
+                + abs(recency_component)
+            )
+            if total_component_abs > 0:
                 self._last_score_breakdowns[metadata.full_path.lower()] = {
-                    "base": round((base_component / total_component) * 100.0, 1),
-                    "lexical": round((bm25_component / total_component) * 100.0, 1),
-                    "intent": round((feature_component / total_component) * 100.0, 1),
-                    "recency": round((recency_component / total_component) * 100.0, 1),
+                    "base": round((base_component / total_component_abs) * 100.0, 1),
+                    "lexical": round((bm25_component / total_component_abs) * 100.0, 1),
+                    "intent": round((feature_component / total_component_abs) * 100.0, 1),
+                    "recency": round((recency_component / total_component_abs) * 100.0, 1),
                 }
 
         reranked.sort(key=lambda x: x[1], reverse=True)
+        reranked = self._apply_result_diversity(reranked)
 
         if self.config.enable_semantic_reranking:
             reranked = self._semantic_rerank(query, reranked)
@@ -573,6 +597,67 @@ class RetrievalService:
         generic = {"personal", "important", "document", "documents", "doc", "docs", "documentation"}
         focused = [t for t in query_tokens if t not in generic]
         return len(focused) == 0
+
+    def _expand_query_terms(self, query: str) -> list[tuple[str, float]]:
+        """Expand query terms with weighted synonyms."""
+        tokens = self._tokenize(query)
+        if not tokens:
+            return []
+
+        seen: dict[str, float] = {}
+        for token in tokens:
+            seen[token] = max(seen.get(token, 0.0), 1.0)
+            for synonym in self._query_synonyms.get(token, []):
+                seen[synonym] = max(seen.get(synonym, 0.0), 0.45)
+
+        return list(seen.items())
+
+    def _infer_extension_priors(self, query_tokens: list[str]) -> dict[str, float]:
+        """Infer extension bonuses from query intent."""
+        priors: dict[str, float] = {}
+
+        if self._is_personal_query(query_tokens):
+            for ext in [".pdf", ".docx", ".doc", ".txt", ".jpg", ".jpeg", ".png"]:
+                priors[ext] = priors.get(ext, 0.0) + 12.0
+
+        if any(tok in {"code", "python", "py", "script", "api"} for tok in query_tokens):
+            for ext in [".py", ".js", ".ts", ".java", ".json"]:
+                priors[ext] = priors.get(ext, 0.0) + 10.0
+
+        if any(tok in {"image", "photo", "picture", "scan"} for tok in query_tokens):
+            for ext in [".jpg", ".jpeg", ".png", ".bmp", ".gif"]:
+                priors[ext] = priors.get(ext, 0.0) + 10.0
+
+        return priors
+
+    def _apply_result_diversity(
+        self,
+        metadata_results: list[tuple[FileMetadata, float]],
+    ) -> list[tuple[FileMetadata, float]]:
+        """Reduce repetitive near-duplicate results from same stems/folders."""
+        if not metadata_results:
+            return metadata_results
+
+        stem_counts: defaultdict[str, int] = defaultdict(int)
+        parent_counts: defaultdict[str, int] = defaultdict(int)
+        diversified: list[tuple[FileMetadata, float]] = []
+
+        for metadata, score in metadata_results:
+            stem = Path(metadata.filename).stem.lower()
+            parent = metadata.parent_folder.lower()
+
+            adjusted_score = score
+            if stem_counts[stem] >= 1:
+                adjusted_score -= stem_counts[stem] * 12.0
+            if parent_counts[parent] >= 3:
+                adjusted_score -= (parent_counts[parent] - 2) * 6.0
+
+            diversified.append((metadata, adjusted_score))
+            stem_counts[stem] += 1
+            parent_counts[parent] += 1
+
+        diversified.sort(key=lambda x: x[1], reverse=True)
+        return diversified
 
     def _contains_any(self, text: str, needles: set[str]) -> bool:
         return any(n in text for n in needles)

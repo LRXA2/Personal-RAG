@@ -786,7 +786,16 @@ async def search(request: SearchRequest):
     
     search_time_ms = (time.time() - start_time) * 1000
     
-    # Convert to simple format
+    # Convert to simple format with normalized relevance percent for UI
+    raw_scores = [r.score for r in results]
+    min_score = min(raw_scores) if raw_scores else 0.0
+    max_score = max(raw_scores) if raw_scores else 0.0
+
+    def _to_relevance_percent(score: float) -> float:
+        if max_score <= min_score:
+            return 100.0
+        return ((score - min_score) / (max_score - min_score)) * 100.0
+
     simple_results = []
     for r in results:
         simple_results.append(FileMetadataSimple(
@@ -796,7 +805,7 @@ async def search(request: SearchRequest):
             extension=r.metadata.extension,
             size=r.metadata.size_bytes,
             modified_date=r.metadata.modified_date.isoformat(),
-            relevance_score=r.score,
+            relevance_score=round(_to_relevance_percent(r.score), 1),
             match_reasons=r.snippets,
             score_breakdown=r.score_breakdown,
         ))

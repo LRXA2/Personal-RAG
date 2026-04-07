@@ -514,15 +514,13 @@
             const reasons = Array.isArray(file.match_reasons) ? file.match_reasons : [];
             const reasonsText = reasons.length ? reasons.join('; ') : '';
             const relevanceText = typeof file.relevance_score === 'number'
-                ? (file.relevance_score <= 1
-                    ? `${(file.relevance_score * 100).toFixed(1)}%`
-                    : `${file.relevance_score.toFixed(1)}`)
+                ? `${file.relevance_score.toFixed(1)}%`
                 : '';
             const scoreBreakdown = (file.score_breakdown && typeof file.score_breakdown === 'object') ? file.score_breakdown : null;
             const breakdownText = scoreBreakdown
                 ? Object.entries(scoreBreakdown)
-                    .filter(([, value]) => typeof value === 'number' && value > 0)
-                    .map(([key, value]) => `${key}: ${value.toFixed(1)}%`)
+                    .filter(([, value]) => typeof value === 'number')
+                    .map(([key, value]) => `${key}: ${value >= 0 ? '+' : ''}${value.toFixed(1)}%`)
                     .join(' | ')
                 : '';
             
