@@ -38,6 +38,21 @@ class RagFileSearch:
         allowed_roots: list[str] = None,
         max_files_to_read: int = 10,
         enable_content_grounding: bool = True,
+        semantic_model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
+        semantic_trust_remote_code: bool = False,
+        semantic_query_prompt_name: str = None,
+        semantic_document_prompt_name: str = None,
+        reranker_model_name: str = None,
+        enable_reranker: bool = False,
+        reranker_trust_remote_code: bool = False,
+        reranker_weight: float = 0.25,
+        enable_llm_query_planner: bool = False,
+        query_planner_model_name: str = "Qwen/Qwen3.5-4B",
+        query_planner_trust_remote_code: bool = True,
+        enable_personal_intent_prefilter: bool = True,
+        enable_expansion_queries: bool = False,
+        disable_top_folder_expansion_for_generic_personal: bool = True,
+        personal_profile_default: str = "balanced",
     ):
         """
         Initialize the file search system.
@@ -46,6 +61,13 @@ class RagFileSearch:
             allowed_roots: Root directories to scan (e.g., ["D:/", "E:/"])
             max_files_to_read: Max files to open per query
             enable_content_grounding: Whether to read file contents for grounding
+            semantic_model_name: SentenceTransformer model for metadata embeddings
+            reranker_model_name: Optional CrossEncoder reranker model
+            enable_llm_query_planner: Whether to use a local LLM for query planning
+            query_planner_model_name: Local/Hugging Face model id for query planning
+            enable_personal_intent_prefilter: Deterministic personal-doc prefilter
+            enable_expansion_queries: Allow LLM expansion queries in ranking
+            personal_profile_default: strict | balanced | off
         """
         # Configure safety policy
         policy = SafetyPolicy(
@@ -58,6 +80,21 @@ class RagFileSearch:
             max_files_to_read=max_files_to_read,
             max_chunks_per_file=5,
             enable_content_grounding=enable_content_grounding,
+            semantic_model_name=semantic_model_name,
+            semantic_trust_remote_code=semantic_trust_remote_code,
+            semantic_query_prompt_name=semantic_query_prompt_name,
+            semantic_document_prompt_name=semantic_document_prompt_name,
+            enable_cross_encoder_reranking=enable_reranker,
+            reranker_model_name=reranker_model_name,
+            reranker_trust_remote_code=reranker_trust_remote_code,
+            reranker_weight=reranker_weight,
+            enable_llm_query_planner=enable_llm_query_planner,
+            query_planner_model_name=query_planner_model_name,
+            query_planner_trust_remote_code=query_planner_trust_remote_code,
+            enable_personal_intent_prefilter=enable_personal_intent_prefilter,
+            enable_expansion_queries=enable_expansion_queries,
+            disable_top_folder_expansion_for_generic_personal=disable_top_folder_expansion_for_generic_personal,
+            personal_profile_default=personal_profile_default,
         )
         
         # Initialize services

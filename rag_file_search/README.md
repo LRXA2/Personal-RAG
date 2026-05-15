@@ -15,7 +15,7 @@ A **metadata-first, two-stage retrieval system** for safely searching files on y
 ## Architecture
 
 ```
-user query → LLM planner → metadata retrieval → shortlisted files → policy filter → content reader → chunks → answer
+user query → metadata/BM25/vector retrieval → candidate fusion → reranking → folder expansion → optional content grounding → answer
 ```
 
 ### Components
@@ -23,9 +23,24 @@ user query → LLM planner → metadata retrieval → shortlisted files → poli
 1. **LLM Planner** (`core/planner.py`): Parses natural language queries into structured search intent
 2. **Metadata Indexer** (`indexer/metadata_indexer.py`): Scans and indexes file metadata
 3. **Safety Policy** (`core/policy.py`): Enforces access controls and safety rules
-4. **Retrieval Service** (`core/retrieval_service.py`): Two-stage retrieval pipeline
+4. **Retrieval Service** (`core/retrieval_service.py`): Hybrid retrieval, reranking, semantic caches, folder expansion
 5. **Content Extractor** (`indexer/content_extractor.py`): Reads and chunks file content
 6. **API Endpoints** (`api/endpoints.py`): FastAPI REST API
+
+### Retrieval Pipeline
+
+The search path is metadata-first and hybrid:
+
+1. **Lexical metadata search** finds direct filename/path matches.
+2. **BM25 metadata search** anchors multi-word queries to exact terms and reduces semantic drift.
+3. **Semantic vector search** finds related metadata even when wording differs.
+4. **Weighted Reciprocal Rank Fusion (RRF)** merges lexical, BM25, and semantic candidates.
+5. **Query coverage gating** suppresses one-token collisions, such as matching only a person's name.
+6. **Heuristic reranking** applies path, recency, type-prior, and coverage adjustments.
+7. **Optional cross-encoder reranking** reranks the top candidates with a local reranker.
+8. **Top-folder expansion** surfaces good child files when a folder ranks highly.
+
+The metadata text used for search includes filename, file type, path breadcrumbs, nearby parent folders, and directory summaries from child filenames.
 
 ## Installation
 
@@ -193,6 +208,73 @@ config = RetrievalConfig(
     enable_content_grounding=True,
 )
 ```
+
+Useful retrieval tuning knobs:
+
+```python
+config = RetrievalConfig(
+    # Hybrid candidate retrieval
+    enable_bm25_retrieval=True,
+    lexical_candidate_weight=1.0,
+    bm25_candidate_weight=1.2,
+    semantic_candidate_weight=0.8,
+    rrf_k=60,
+
+    # Semantic retrieval speed/accuracy
+    enable_two_phase_semantic_search=True,
+    semantic_candidate_pool_multiplier=6,
+    semantic_fallback_min_coverage=0.67,
+
+    # Query coverage and type priors
+    enable_query_coverage_gate=True,
+    min_query_coverage=0.5,
+    enable_semantic_type_priors=True,
+    semantic_type_prior_weight=12.0,
+
+    # Folder expansion
+    enable_top_folder_expansion=True,
+    top_folders_to_expand=5,
+    max_child_results_per_folder=5,
+)
+```
+
+### Embedding Cache
+
+Metadata embeddings are persisted separately from the metadata index:
+
+```text
+.cache/metadata_index.pkl                 # metadata index
+.cache/metadata_index.embeddings.sqlite3  # SQLite embedding cache
+```
+
+If you change embedding models or prompt settings, reset/rebuild the index so vectors are regenerated.
+
+### Optional Local Jina Models
+
+By default, retrieval behavior remains unchanged. If you have local Jina models installed, you can opt in with environment variables:
+
+```bash
+set RAG_SEMANTIC_MODEL=jinaai/jina-embeddings-v5-omni-small-retrieval
+set RAG_SEMANTIC_TRUST_REMOTE_CODE=true
+set RAG_ENABLE_RERANKER=true
+set RAG_RERANKER_MODEL=jinaai/jina-reranker-v3
+set RAG_RERANKER_TRUST_REMOTE_CODE=true
+set RAG_RERANKER_WEIGHT=0.25
+```
+
+The reranker only adjusts the top hybrid candidates and is blended with the existing score, so lexical/path matching still carries most of the ranking.
+
+### Optional Local LLM Query Planner
+
+You can use a local instruct model such as Qwen to structure queries into anchors and concepts before retrieval. This is optional; if model loading or JSON parsing fails, the rule-based planner is used automatically.
+
+```bash
+set RAG_ENABLE_LLM_QUERY_PLANNER=true
+set RAG_QUERY_PLANNER_MODEL=Qwen/Qwen3.5-4B
+set RAG_QUERY_PLANNER_TRUST_REMOTE_CODE=true
+```
+
+The LLM planner is used only for query planning. File retrieval still runs through the local metadata, BM25, vector, and reranking pipeline.
 
 ## Future Enhancements
 

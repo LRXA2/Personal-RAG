@@ -43,6 +43,10 @@ class SearchRequest(BaseModel):
     query: str
     max_results: int = 50
     document_type: str = "all"
+    debug: bool = False
+    personal_profile: Optional[str] = None
+    allowed_file_types: Optional[List[str]] = None
+    blocked_extensions: Optional[List[str]] = None
 
 
 class FileMetadataSimple(BaseModel):
@@ -61,6 +65,7 @@ class SearchResponse(BaseModel):
     results: List[FileMetadataSimple]
     search_time_ms: float
     total_found: int
+    debug: Optional[dict] = None
 
 
 class RetrieveFilesRequest(BaseModel):
@@ -71,6 +76,10 @@ class RetrieveFilesRequest(BaseModel):
     date_to: Optional[datetime] = None
     folder_contains: Optional[str] = None
     max_results: int = 50
+    debug: bool = False
+    personal_profile: Optional[str] = None
+    allowed_file_types: Optional[List[str]] = None
+    blocked_extensions: Optional[List[str]] = None
 
 
 class FileMetadataResponse(BaseModel):
@@ -94,6 +103,7 @@ class SearchResultResponse(BaseModel):
 class RetrieveFilesResponse(BaseModel):
     results: List[SearchResultResponse]
     total_found: int
+    debug: Optional[dict] = None
 
 
 class ReadFileRequest(BaseModel):
@@ -209,6 +219,33 @@ def _get_default_scan_directories() -> list[str]:
 def _get_index_cache_path() -> str:
     """Get index cache path from env var or default."""
     return os.getenv("RAG_INDEX_CACHE_PATH", DEFAULT_INDEX_CACHE_PATH)
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
 
 
 def _validate_scan_directories(directories: List[str], active_policy: SafetyPolicy) -> list[str]:
@@ -330,8 +367,29 @@ async def startup_event():
         max_metadata_results=50,
         max_files_to_read=10,
         max_chunks_per_file=5,
+        semantic_model_name=os.getenv("RAG_SEMANTIC_MODEL", "sentence-transformers/all-MiniLM-L6-v2"),
+        semantic_trust_remote_code=_env_bool("RAG_SEMANTIC_TRUST_REMOTE_CODE", False),
+        semantic_query_prompt_name=os.getenv("RAG_SEMANTIC_QUERY_PROMPT") or None,
+        semantic_document_prompt_name=os.getenv("RAG_SEMANTIC_DOCUMENT_PROMPT") or None,
         lexical_weight=0.6,
         semantic_weight=0.4,
+        enable_cross_encoder_reranking=_env_bool("RAG_ENABLE_RERANKER", False),
+        reranker_model_name=os.getenv("RAG_RERANKER_MODEL") or None,
+        reranker_trust_remote_code=_env_bool("RAG_RERANKER_TRUST_REMOTE_CODE", False),
+        reranker_top_k=_env_int("RAG_RERANKER_TOP_K", 50),
+        reranker_weight=_env_float("RAG_RERANKER_WEIGHT", 0.25),
+        enable_llm_query_planner=_env_bool("RAG_ENABLE_LLM_QUERY_PLANNER", False),
+        query_planner_model_name=os.getenv("RAG_QUERY_PLANNER_MODEL", "Qwen/Qwen3.5-4B"),
+        query_planner_trust_remote_code=_env_bool("RAG_QUERY_PLANNER_TRUST_REMOTE_CODE", True),
+        query_planner_max_new_tokens=_env_int("RAG_QUERY_PLANNER_MAX_NEW_TOKENS", 512),
+        query_planner_temperature=_env_float("RAG_QUERY_PLANNER_TEMPERATURE", 0.0),
+        enable_personal_intent_prefilter=_env_bool("RAG_ENABLE_PERSONAL_INTENT_PREFILTER", True),
+        enable_expansion_queries=_env_bool("RAG_ENABLE_EXPANSION_QUERIES", False),
+        disable_top_folder_expansion_for_generic_personal=_env_bool(
+            "RAG_DISABLE_TOP_FOLDER_EXPANSION_FOR_GENERIC_PERSONAL",
+            True,
+        ),
+        personal_profile_default=(os.getenv("RAG_PERSONAL_PROFILE_DEFAULT", "balanced") or "balanced").strip().lower(),
     )
     
     retrieval_service = RetrievalService(policy=policy, config=config)
@@ -426,8 +484,13 @@ async def retrieve_files(request: RetrieveFilesRequest):
         date_to=request.date_to,
         folder_contains=request.folder_contains,
         needs_content=False,  # Metadata only
+        personal_profile=request.personal_profile,
+        allowed_file_types_override=request.allowed_file_types,
+        blocked_extensions_override=request.blocked_extensions,
     )
     
+    debug_payload = retrieval_service.get_last_debug_info() if request.debug else None
+
     return RetrieveFilesResponse(
         results=[
             SearchResultResponse(
@@ -448,6 +511,7 @@ async def retrieve_files(request: RetrieveFilesRequest):
             for r in results
         ],
         total_found=len(results),
+        debug=debug_payload,
     )
 
 
@@ -709,11 +773,17 @@ async def reset_index():
     retrieval_service.clear_index()
 
     cache_path = Path(_get_index_cache_path())
+    semantic_cache_paths = [Path(path) for path in retrieval_service.get_semantic_cache_paths(str(cache_path))]
     cache_removed = False
+    removed_semantic_cache_paths = []
     try:
         if cache_path.exists():
             cache_path.unlink()
             cache_removed = True
+        for semantic_cache_path in semantic_cache_paths:
+            if semantic_cache_path.exists():
+                semantic_cache_path.unlink()
+                removed_semantic_cache_paths.append(str(semantic_cache_path))
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Index cleared but failed to remove cache: {exc}")
 
@@ -729,7 +799,9 @@ async def reset_index():
     return {
         "cleared": True,
         "cache_removed": cache_removed,
+        "semantic_cache_removed": bool(removed_semantic_cache_paths),
         "cache_path": str(cache_path),
+        "semantic_cache_paths": removed_semantic_cache_paths,
     }
 
 
@@ -782,6 +854,9 @@ async def search(request: SearchRequest):
         file_type_filter=file_type_filter,
         max_results=request.max_results,
         needs_content=False,
+        personal_profile=request.personal_profile,
+        allowed_file_types_override=request.allowed_file_types,
+        blocked_extensions_override=request.blocked_extensions,
     )
     
     search_time_ms = (time.time() - start_time) * 1000
@@ -810,10 +885,13 @@ async def search(request: SearchRequest):
             score_breakdown=r.score_breakdown,
         ))
     
+    debug_payload = retrieval_service.get_last_debug_info() if request.debug else None
+
     return SearchResponse(
         results=simple_results,
         search_time_ms=search_time_ms,
         total_found=len(simple_results),
+        debug=debug_payload,
     )
 
 
