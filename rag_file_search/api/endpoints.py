@@ -35,6 +35,7 @@ from core.planner import LLMPlanner
 
 DEFAULT_ALLOWED_ROOTS = ["D:/", "E:/"]
 DEFAULT_INDEX_CACHE_PATH = ".cache/metadata_index.pkl"
+PUBLIC_MODE = os.getenv("RAG_PUBLIC_MODE", "false").strip().lower() in {"1", "true", "yes", "on"}
 
 
 # Request/Response models
@@ -172,6 +173,9 @@ app = FastAPI(
     title="RAG File Search API",
     description="Metadata-first file search with selective content grounding",
     version="1.0.0",
+    docs_url=None if PUBLIC_MODE else "/docs",
+    redoc_url=None if PUBLIC_MODE else "/redoc",
+    openapi_url=None if PUBLIC_MODE else "/openapi.json",
 )
 
 # Initialize services (will be configured on startup)
@@ -246,6 +250,15 @@ def _env_float(name: str, default: float) -> float:
         return float(raw)
     except ValueError:
         return default
+
+
+def _enforce_public_endpoint(path: str) -> None:
+    """Hide non-public endpoints when running in public mode."""
+    if not PUBLIC_MODE:
+        return
+    allowed = {"/search", "/download", "/index/scan", "/index/reset"}
+    if path not in allowed:
+        raise HTTPException(status_code=404, detail="Not found")
 
 
 def _validate_scan_directories(directories: List[str], active_policy: SafetyPolicy) -> list[str]:
@@ -468,6 +481,7 @@ async def retrieve_files(request: RetrieveFilesRequest):
     """
     if retrieval_service is None:
         raise HTTPException(status_code=503, detail="Service not initialized")
+    _enforce_public_endpoint("/retrieve/files")
 
     file_type_filter, extension_filter = _resolve_document_filters(
         request.document_type,
@@ -524,6 +538,7 @@ async def read_file(request: ReadFileRequest):
     """
     if retrieval_service is None:
         raise HTTPException(status_code=503, detail="Service not initialized")
+    _enforce_public_endpoint("/read/file")
     
     # Check policy
     can_read, reason = retrieval_service.policy.can_read_content(
@@ -582,6 +597,7 @@ async def extract_chunks(request: ExtractChunksRequest):
     """
     if retrieval_service is None:
         raise HTTPException(status_code=503, detail="Service not initialized")
+    _enforce_public_endpoint("/extract/chunks")
     
     # First check if we can read this file
     can_read, reason = retrieval_service.policy.can_read_content(
@@ -627,6 +643,7 @@ async def answer(request: AnswerRequest):
     """
     if retrieval_service is None or planner is None:
         raise HTTPException(status_code=503, detail="Service not initialized")
+    _enforce_public_endpoint("/answer")
     
     # Parse query intent
     intent = planner.parse_query(request.query)
@@ -675,6 +692,7 @@ async def answer(request: AnswerRequest):
 @app.get("/stats", response_model=StatsResponse)
 async def get_stats():
     """Get index statistics."""
+    _enforce_public_endpoint("/stats")
     if retrieval_service is None:
         raise HTTPException(status_code=503, detail="Service not initialized")
     
@@ -808,6 +826,7 @@ async def reset_index():
 @app.get("/health")
 async def health_check():
     """Health check endpoint."""
+    _enforce_public_endpoint("/health")
     with _index_status_lock:
         is_indexing = _index_status["is_indexing"]
         indexed_files = _index_status["indexed_files"]
@@ -986,5 +1005,6 @@ async def download(path: str = Query(..., description="File path to download")):
 @app.get("/index/status", response_model=IndexStatusResponse)
 async def index_status():
     """Return startup indexing status for UI progress display."""
+    _enforce_public_endpoint("/index/status")
     with _index_status_lock:
         return IndexStatusResponse(**_index_status)

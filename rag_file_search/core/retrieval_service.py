@@ -924,6 +924,11 @@ class RetrievalService:
                 if "documentation" in filename_lower_local and (metadata.file_type == "code" or ext in code_like_exts):
                     feature_bonus -= 18.0
 
+                # Even for navigation queries, generic project folder names should
+                # not outrank actual personal documents.
+                if metadata.file_type == "folder" and self._is_low_signal_folder_name(metadata.filename):
+                    feature_bonus -= 24.0
+
             recency_bonus = self._recency_bonus(metadata.modified_date, now, wants_recent)
 
             # Blend original ranker with reranker signals.
@@ -2255,6 +2260,19 @@ class RetrievalService:
     def _path_tail_text(self, path: str, segments: int = 3) -> str:
         parts = [p for p in Path(path).parts if p and p not in {"/", "\\"}]
         return " ".join(parts[-segments:])
+
+    def _is_low_signal_folder_name(self, folder_name: str) -> bool:
+        token = (folder_name or "").strip().lower()
+        if not token:
+            return True
+
+        low_signal = {
+            "src", "source", "ui", "views", "view", "components", "assets",
+            "build", "dist", "lib", "libs", "bin", "obj", "tmp", "temp",
+            "tests", "test", "docs", "doc", "examples", "scripts", "tools",
+            "node_modules", "__pycache__", "venv",
+        }
+        return token in low_signal
 
     def _recency_bonus(self, modified_date: datetime, now: datetime, wants_recent: bool) -> float:
         age_days = max((now - modified_date).days, 0)
